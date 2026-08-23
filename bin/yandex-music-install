@@ -268,9 +268,10 @@ case "$mode" in
     fi
     capture_session || log "warning: could not determine the user session"
     notify "Обновление" "Устанавливается новая версия…"
-    # electron-updater relaunches the app right after our caller returns; give
-    # that instance time to appear so it is not left running on top of the
-    # files dnf is about to replace.
+    # The patched app quits without relaunching itself, so this is just time for
+    # it to go away on its own; stop_app is the safety net for an instance that
+    # refuses to, which must not be left running on top of the files dnf is
+    # about to replace.
     sleep 5
     stop_app
     # A subshell so a failure inside do_install lands here instead of exiting.
@@ -282,6 +283,8 @@ case "$mode" in
       notify "Обновление установлено" "Яндекс Музыка ${version:-обновлена}"
     else
       notify "Не удалось обновить" "Подробности: $LOG"
+      # Nothing relaunches the app any more, so bring the old version back.
+      relaunch_app || true
     fi
     log "done"
     ;;

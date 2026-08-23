@@ -17,16 +17,28 @@ const cmd = ["dpkg", "-i", installerPath, "||", "apt-get", "install", "-f", "-y"
 На RPM-системе ни `apt-get`, ни базы `dpkg` нет, поэтому кнопка «Обновить»
 показывает polkit-запрос пароля и после него молча ничего не делает.
 
-`patch-yandex-music-updater` заменяет этот массив прямо в
-`resources/app.asar` — **байт в байт той же длины**, поэтому заголовок asar
-с офсетами остаётся валидным и распаковка/переупаковка не нужна:
+`patch-yandex-music-updater` правит `resources/app.asar` **байт в байт той же
+длины**, поэтому заголовок asar с офсетами остаётся валидным и
+распаковка/переупаковка не нужна. Патчей два:
 
 ```js
+// install-command
 const cmd = ["/usr/local/bin/yandex-music-install", installerPath]               ;
+
+// no-relaunch: свойства isForceRunNever не существует, значит relaunch не будет
+if (options.isForceRunNever) {
+    this.app.relaunch();
+}
 ```
 
-Дальше приложение само вызывает `pkexec /bin/bash -c '…'`, а хелпер уже делает
-`alien` + `dnf install` и заново накладывает патч на свежий `app.asar`.
+Первый переводит установку на хелпер: приложение вызывает
+`pkexec /bin/bash -c '…'`, а тот делает `alien` + `dnf install` и заново
+накладывает патчи на свежий `app.asar`.
+
+Второй убирает `app.relaunch()` из `DebUpdater.doInstall`. Без него приложение
+успевает вернуться на **старой** версии прямо посреди установки, снова показать
+баннер «Доступна версия…» и зависнуть, когда установщик его останавливает.
+С патчем оно просто закрывается, а новую версию запускает уже хелпер.
 
 ### Почему хелпер уходит в фон
 
@@ -39,9 +51,8 @@ const cmd = ["/usr/local/bin/yandex-music-install", installerPath]              
 
 1. определяет пользователя (`PKEXEC_UID`, иначе владелец процесса приложения,
    иначе владелец скачанного `.deb`) и его шину `/run/user/$UID/bus`;
-2. ждёт 5 с (за это время `electron-updater` перезапускает приложение) и гасит
-   все его процессы — `SIGTERM`, через 8 с `SIGKILL`, приложение не реагирует на
-   `SIGTERM`;
+2. ждёт 5 с, пока приложение закроется само, и на всякий случай гасит остатки —
+   `SIGTERM`, через 8 с `SIGKILL`, на `SIGTERM` приложение не реагирует;
 3. конвертирует и ставит пакет, перепатчивает `app.asar`, удаляет скачанный
    `.deb` из `~/.cache/yandexmusic-updater/pending/`;
 4. запускает приложение обратно — через `systemd-run --user`, чтобы оно не
@@ -117,7 +128,7 @@ ymupd --download-json  # взять версию с сайта, а не из ф�
 |---|---|
 | `bin/yandex-music-update` | CLI: версия из фида → скачивание → проверка `sha512` → установка |
 | `bin/yandex-music-install` | root-хелпер: `alien` → `dnf install` → перепатч `app.asar`; по умолчанию фоново, `--foreground` — синхронно |
-| `bin/patch-yandex-music-updater` | правка команды обновления в `app.asar` (`--check`, `--revert`) |
+| `bin/patch-yandex-music-updater` | правка `app.asar`: команда установки и отмена самоперезапуска (`--check`, `--revert`) |
 | `install.sh` / `uninstall.sh` | установка и полный откат |
 
 ## Удаление

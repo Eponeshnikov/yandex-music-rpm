@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
-"""Point Yandex Music's in-app updater at an RPM-friendly install command.
+"""Make Yandex Music's in-app updater work on an RPM system.
 
-The app bundles electron-updater, whose DebUpdater hardcodes
+The app bundles electron-updater, whose DebUpdater does two things that make no
+sense here. It hardcodes the install command
 
     const cmd = ["dpkg", "-i", installerPath, "||", "apt-get", "install", "-f", "-y"];
 
-inside resources/app.asar. On an RPM system that command is meaningless — there
-is no apt and no dpkg database — so the app's "Обновить" button pops a polkit
-prompt and then fails.
+which on an RPM system finds no apt and no dpkg database, and it calls
+`this.app.relaunch()` before quitting — so the app comes back on the *old*
+version while the install is still running, shows the update banner again, and
+then freezes as the installer stops it.
 
-This replaces that array, in place and byte-for-byte the same length (so the
-asar header's offsets and sizes stay valid, no repacking needed), with a call to
-yandex-music-install, which converts the .deb with alien and installs it with
-dnf. The app spawns the command with shell:true as
+Both are edited in place inside resources/app.asar, byte-for-byte the same
+length, so the asar header's offsets and sizes stay valid and nothing has to be
+repacked:
 
-    pkexec /bin/bash -c '<cmd>'
-
-so a plain absolute path is all that is needed.
+* the command becomes a call to yandex-music-install, which converts the .deb
+  with alien and installs it with dnf. The app spawns it with shell:true as
+  `pkexec /bin/bash -c '<cmd>'`, so an absolute path is all it takes;
+* `options.isForceRunAfter` becomes `options.isForceRunNever`, an undefined
+  property — the app simply quits, and yandex-music-install starts the new
+  version once it is in place.
 
 Re-run after every reinstall of the package; it is idempotent.
 """
@@ -24,16 +28,48 @@ Re-run after every reinstall of the package; it is idempotent.
 import argparse
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 HELPER = "/usr/local/bin/yandex-music-install"
 
-ORIG = b'["dpkg", "-i", installerPath, "||", "apt-get", "install", "-f", "-y"]'
-PATCHED = b'["' + HELPER.encode() + b'", installerPath]'
-# Padding keeps the byte length identical; trailing spaces before ] are valid JS
-# and add no element to the array.
-PATCHED += b" " * (len(ORIG) - len(PATCHED))
-assert len(PATCHED) == len(ORIG), "replacement must not change the file size"
+
+@dataclass(frozen=True)
+class Patch:
+    name: str
+    orig: bytes
+    patched: bytes
+    required: bool
+
+    def __post_init__(self) -> None:
+        assert len(self.orig) == len(self.patched), f"{self.name} changes the file size"
+
+
+def _install_command() -> Patch:
+    orig = b'["dpkg", "-i", installerPath, "||", "apt-get", "install", "-f", "-y"]'
+    patched = b'["' + HELPER.encode() + b'", installerPath]'
+    # Trailing spaces before ] are valid JS and add no element to the array.
+    patched += b" " * (len(orig) - len(patched))
+    return Patch("install-command", orig, patched, required=True)
+
+
+def _no_relaunch() -> Patch:
+    # The bare property name appears in every updater backend, so anchor on the
+    # whole tail of DebUpdater.doInstall, which is unique.
+    orig = (
+        b"if (options.isForceRunAfter) {\n"
+        b"            this.app.relaunch();\n"
+        b"        }\n"
+        b"        return true;\n"
+        b"    }\n"
+        b"}\n"
+        b"exports.DebUpdater = DebUpdater;"
+    )
+    patched = orig.replace(b"isForceRunAfter", b"isForceRunNever", 1)
+    return Patch("no-relaunch", orig, patched, required=False)
+
+
+PATCHES = (_install_command(), _no_relaunch())
 
 
 def find_asar() -> Path:
@@ -50,7 +86,8 @@ def find_asar() -> Path:
         pass
 
     for candidate in sorted(Path("/opt").glob("*/resources/app.asar")):
-        if "музык" in candidate.parts[2].lower() or "music" in candidate.parts[2].lower():
+        name = candidate.parts[2].lower()
+        if "музык" in name or "music" in name:
             return candidate
 
     sys.exit("patch-yandex-music-updater: could not find app.asar, pass --asar")
@@ -73,7 +110,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("--revert", action="store_true", help="restore the stock dpkg command")
+    ap.add_argument("--revert", action="store_true", help="restore the stock behaviour")
     ap.add_argument("--check", action="store_true", help="report status only, change nothing")
     ap.add_argument("--asar", type=Path, help="path to app.asar (default: autodetect)")
     args = ap.parse_args()
@@ -82,49 +119,63 @@ def main() -> int:
     if not asar.is_file():
         sys.exit(f"patch-yandex-music-updater: not found: {asar}")
 
-    data = asar.read_bytes()
-    at_orig = find_one(data, ORIG, "stock")
-    at_patched = find_one(data, PATCHED, "patched")
-
-    if args.check:
-        if at_patched != -1:
-            print(f"patched (offset {at_patched}) -> {HELPER}")
-            return 0
-        if at_orig != -1:
-            print(f"stock (offset {at_orig}) -> dpkg/apt-get")
-            return 1
-        print("unknown: neither the stock nor the patched command was found")
-        return 2
-
-    want, have, at = (
-        (ORIG, PATCHED, at_patched) if args.revert else (PATCHED, ORIG, at_orig)
-    )
-
-    if at == -1:
-        if find_one(data, want, "target") != -1:
-            print("patch-yandex-music-updater: already in the requested state")
-            return 0
-        sys.exit(
-            "patch-yandex-music-updater: install command not found — upstream probably "
-            "changed it; re-check DebUpdater inside app.asar"
-        )
-
-    if not args.revert and not Path(HELPER).is_file():
+    if not args.check and not args.revert and not Path(HELPER).is_file():
         sys.exit(f"patch-yandex-music-updater: helper missing: {HELPER}")
 
-    try:
+    data = asar.read_bytes()
+    status = 0
+    changed = []
+
+    for patch in PATCHES:
+        at_orig = find_one(data, patch.orig, f"stock {patch.name}")
+        at_patched = find_one(data, patch.patched, f"patched {patch.name}")
+
+        if args.check:
+            if at_patched != -1:
+                print(f"{patch.name}: patched (offset {at_patched})")
+            elif at_orig != -1:
+                print(f"{patch.name}: stock (offset {at_orig})")
+                status = max(status, 1)
+            else:
+                print(f"{patch.name}: unknown, neither form found")
+                status = max(status, 2)
+            continue
+
+        want, have, at = (
+            (patch.orig, patch.patched, at_patched)
+            if args.revert
+            else (patch.patched, patch.orig, at_orig)
+        )
+
+        if at == -1:
+            if find_one(data, want, patch.name) != -1:
+                continue  # already in the requested state
+            message = (
+                f"patch-yandex-music-updater: {patch.name} not found — upstream "
+                "probably changed it; re-check DebUpdater inside app.asar"
+            )
+            if patch.required:
+                sys.exit(message)
+            print(f"warning: {message}", file=sys.stderr)
+            status = max(status, 1)
+            continue
+
         with asar.open("r+b") as fh:
             fh.seek(at)
             if fh.read(len(have)) != have:
-                sys.exit("patch-yandex-music-updater: unexpected bytes at offset, aborting")
+                sys.exit(
+                    f"patch-yandex-music-updater: unexpected bytes for {patch.name}, aborting"
+                )
             fh.seek(at)
             fh.write(want)
-    except PermissionError:
-        sys.exit(f"patch-yandex-music-updater: need root to write {asar}")
+        changed.append(f"{patch.name}@{at}")
 
-    action = "reverted" if args.revert else "patched"
-    print(f"patch-yandex-music-updater: {action} {asar} at offset {at}")
-    return 0
+    if not args.check:
+        action = "reverted" if args.revert else "patched"
+        detail = ", ".join(changed) if changed else "nothing to do"
+        print(f"patch-yandex-music-updater: {action} {asar}: {detail}")
+
+    return status
 
 
 if __name__ == "__main__":
