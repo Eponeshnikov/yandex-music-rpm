@@ -150,6 +150,6 @@ fi
 [[ -x "$INSTALLER" ]] || die "installer helper not found: $INSTALLER (run install.sh)"
 
 log "installing as root"
-as_root "$INSTALLER" "$workdir/$deb_file"
+as_root "$INSTALLER" --foreground "$workdir/$deb_file"
 
 log "Yandex Music $version installed"

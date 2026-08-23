@@ -1,27 +1,39 @@
 #!/usr/bin/env bash
 # Install a Yandex Music .deb on an RPM-based system.
 #
-# Runs as root. Converts the package with alien and installs the resulting RPM
-# with dnf, then re-applies the app.asar patch so the app's own "Обновить"
-# button keeps landing here instead of on dpkg/apt-get.
+# Runs as root. Converts the package with alien, installs the resulting RPM with
+# dnf, then re-applies the app.asar patch so the app's own "Обновить" button
+# keeps landing here instead of on dpkg/apt-get.
 #
-# Called both by yandex-music-update and by the patched app itself (through
-# pkexec), so its argument list must stay `<path-to-deb>`.
+# Called both by yandex-music-update (with --foreground) and by the patched app
+# itself through `pkexec /bin/bash -c '<this> <deb>'`. The app runs that command
+# with a *synchronous* spawnSync, so the default mode detaches a worker and
+# returns at once — otherwise the whole UI freezes for the minute or two the
+# conversion takes and the desktop offers to force-quit it, which kills the
+# install halfway through.
 set -Eeuo pipefail
 
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 LOG="${YM_LOG:-/var/log/yandex-music-install.log}"
 PATCHER=/usr/local/bin/patch-yandex-music-updater
+APP_BIN="${YM_APP_BIN:-/usr/bin/yandexmusic}"
+APP_DIR="${YM_APP_DIR:-/opt/Яндекс Музыка}"
 
+mode=detach   # detach | foreground | worker
 do_patch=1
 deb=""
 
 usage() {
   cat <<'EOF'
-Usage: yandex-music-install [--no-patch] <Yandex_Music_amd64_X.Y.Z.deb>
+Usage: yandex-music-install [--foreground] [--no-patch] <Yandex_Music_amd64_X.Y.Z.deb>
 
 Converts the .deb to an RPM with alien and installs it with dnf. Must run as
 root. Re-applies the in-app updater patch afterwards unless --no-patch.
+
+  --foreground  Do the work in this process and print progress (used by
+                yandex-music-update). The default detaches a background worker,
+                restarts the app when the install is done and returns
+                immediately, which is what the app's own updater needs.
 EOF
 }
 
@@ -39,6 +51,8 @@ die() {
 
 while (($#)); do
   case "$1" in
+    --foreground) mode=foreground ;;
+    --worker) mode=worker ;;
     --no-patch) do_patch=0 ;;
     -h|--help) usage; exit 0 ;;
     -*) die "unknown argument: $1" ;;
@@ -57,27 +71,154 @@ for cmd in alien dnf rpm; do
   command -v "$cmd" >/dev/null 2>&1 || die "required command not found: $cmd"
 done
 
-log "installing $deb"
+# --- session helpers, for the detached worker ------------------------------
 
-workdir="$(mktemp -d -t yandex-music-install.XXXXXX)"
-trap 'rm -rf "$workdir"' EXIT
+# Match on the executable behind each pid, not on the command line: every
+# Electron helper process (gpu, zygote, renderers) runs the same binary, and a
+# command line can be matched by accident — including our own.
+app_pids() {
+  local proc exe pids=()
+  for proc in /proc/[0-9]*; do
+    exe="$(readlink -f "$proc/exe" 2>/dev/null || true)"
+    [[ "$exe" == "$APP_DIR"/* ]] && pids+=("${proc#/proc/}")
+  done
+  ((${#pids[@]})) && printf '%s\n' "${pids[@]}"
+  return 0
+}
 
-cp -- "$deb" "$workdir/"
-cd "$workdir"
+# The app is about to be killed and restarted, so its own environment is the
+# only reliable source of the user's graphical session.
+capture_session() {
+  session_uid="${PKEXEC_UID:-}"
+  session_env=()
+  local pid environ value
+  for pid in $(app_pids); do
+    [[ -r "/proc/$pid/environ" ]] || continue
+    [[ -n "$session_uid" ]] || session_uid="$(stat -c %u "/proc/$pid")"
+    environ="$(tr '\0' '\n' <"/proc/$pid/environ")"
+    for var in DISPLAY WAYLAND_DISPLAY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS \
+               XAUTHORITY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP LANG; do
+      value="$(grep -m1 "^$var=" <<<"$environ" || true)"
+      [[ -n "$value" ]] && session_env+=("$value")
+    done
+    break
+  done
+  [[ -n "$session_uid" ]] || return 1
+  session_user="$(id -nu "$session_uid" 2>/dev/null)" || return 1
+}
 
-log "converting deb to rpm with alien"
-alien -r --scripts "$(basename -- "$deb")" >>"$LOG" 2>&1 \
-  || die "alien failed, see $LOG"
+run_as_user() {
+  [[ -n "${session_user:-}" ]] || return 1
+  runuser -u "$session_user" -- env "${session_env[@]}" "$@"
+}
 
-rpm_file="$(find . -maxdepth 1 -type f -name '*.rpm' | sort | tail -n 1)"
-[[ -n "$rpm_file" ]] || die "alien did not produce an RPM file"
+notify() {
+  run_as_user notify-send -a "Яндекс Музыка" -i yandexmusic "$@" >/dev/null 2>&1 || true
+}
 
-log "installing $(basename -- "$rpm_file") with dnf"
-dnf install -y "$rpm_file" >>"$LOG" 2>&1 || die "dnf install failed, see $LOG"
+# Hand the app to the user's own systemd manager. Starting it as a child of
+# this worker would not do: the worker is a transient unit, and everything left
+# in its cgroup dies the moment it exits.
+relaunch_app() {
+  local unit="yandex-music-$(date +%s)" args=() kv
+  [[ -x "$APP_BIN" ]] || APP_BIN="$APP_DIR/yandexmusic"
+  for kv in "${session_env[@]}"; do args+=(--setenv="$kv"); done
+  if run_as_user systemd-run --user --quiet --collect --unit="$unit" \
+       "${args[@]}" -- "$APP_BIN" >>"$LOG" 2>&1; then
+    return 0
+  fi
+  log "warning: could not restart the app, start it from the menu"
+  return 1
+}
 
-if ((do_patch)) && [[ -x "$PATCHER" ]]; then
-  log "re-applying in-app updater patch"
-  "$PATCHER" >>"$LOG" 2>&1 || log "warning: patch failed, see $LOG"
-fi
+stop_app() {
+  local pids deadline
+  pids="$(app_pids)"
+  [[ -n "$pids" ]] || return 0
+  log "stopping the running app"
+  # shellcheck disable=SC2086
+  kill -TERM $pids 2>/dev/null || true
+  deadline=$((SECONDS + 8))
+  while [[ -n "$(app_pids)" ]] && ((SECONDS < deadline)); do sleep 1; done
+  pids="$(app_pids)"
+  if [[ -n "$pids" ]]; then
+    # shellcheck disable=SC2086
+    kill -KILL $pids 2>/dev/null || true
+    sleep 1
+  fi
+}
 
-log "done"
+# --- the actual install ----------------------------------------------------
+
+do_install() {
+  log "installing $deb"
+
+  workdir="$(mktemp -d -t yandex-music-install.XXXXXX)"
+  trap 'rm -rf "$workdir"' EXIT
+
+  cp -- "$deb" "$workdir/"
+
+  log "converting deb to rpm with alien"
+  # An uncompressed payload cuts the conversion of a ~90 MB package from minutes
+  # to seconds; the RPM is a throwaway that dnf reads back immediately.
+  printf '%%_binary_payload w0.gzdio\n' >"$workdir/.rpmmacros"
+  ( cd "$workdir" && HOME="$workdir" alien -r --scripts "$(basename -- "$deb")" ) \
+    >>"$LOG" 2>&1 || die "alien failed, see $LOG"
+
+  rpm_file="$(find "$workdir" -maxdepth 1 -type f -name '*.rpm' | sort | tail -n 1)"
+  [[ -n "$rpm_file" ]] || die "alien did not produce an RPM file"
+
+  log "installing $(basename -- "$rpm_file") with dnf"
+  dnf install -y --allow-downgrade "$rpm_file" >>"$LOG" 2>&1 \
+    || die "dnf install failed, see $LOG"
+
+  if ((do_patch)) && [[ -x "$PATCHER" ]]; then
+    log "re-applying in-app updater patch"
+    "$PATCHER" >>"$LOG" 2>&1 || log "warning: patch failed, see $LOG"
+  fi
+}
+
+case "$mode" in
+  detach)
+    # Fully detach: the app captures our stdout with a synchronous spawn, so an
+    # inherited pipe would keep it blocked no matter that we already exited.
+    worker_args=(--worker)
+    ((do_patch)) || worker_args+=(--no-patch)
+    if command -v systemd-run >/dev/null 2>&1; then
+      # A transient unit leaves the app's cgroup behind, so the install survives
+      # the app quitting — or the desktop force-quitting it.
+      systemd-run --quiet --collect \
+        --property=KillMode=process \
+        --unit="yandex-music-install-$(date +%s)" \
+        --description="Yandex Music update" \
+        -- "$0" "${worker_args[@]}" "$deb"
+    else
+      setsid "$0" "${worker_args[@]}" "$deb" </dev/null >>"$LOG" 2>&1 &
+    fi
+    exit 0
+    ;;
+  foreground)
+    do_install
+    log "done"
+    ;;
+  worker)
+    capture_session || log "warning: could not determine the user session"
+    notify "Обновление" "Устанавливается новая версия…"
+    # electron-updater relaunches the app right after our caller returns; give
+    # that instance time to appear so it is not left running on top of the
+    # files dnf is about to replace.
+    sleep 5
+    stop_app
+    # A subshell so a failure inside do_install lands here instead of exiting.
+    if ( do_install ); then
+      version="$(rpm -q --qf '%{VERSION}' yandexmusic 2>/dev/null || echo '')"
+      [[ "$deb" == */yandexmusic-updater/pending/* ]] && rm -f -- "$deb"
+      log "restarting the app"
+      relaunch_app
+      notify "Обновление установлено" "Яндекс Музыка ${version:-обновлена}"
+    else
+      notify "Не удалось обновить" "Подробности: $LOG"
+    fi
+    log "done"
+    ;;
+esac
