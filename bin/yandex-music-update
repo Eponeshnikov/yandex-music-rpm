@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# Update Yandex Music on an RPM-based system.
+#
+# Resolves the current version from the app's own electron-updater feed
+# (latest-linux.yml) — the source behind the in-app "Доступна версия X" banner,
+# which runs ahead of the website's download.json — downloads the .deb, verifies
+# its sha512, and hands it to yandex-music-install as root.
+set -Eeuo pipefail
+
+BASE_URL="${YM_BASE_URL:-https://desktop.app.music.yandex.net/stable}"
+INSTALLER="${YM_INSTALLER:-/usr/local/bin/yandex-music-install}"
+PACKAGE=yandexmusic
+
+usage() {
+  cat <<'EOF'
+Usage: yandex-music-update [options]
+
+Options:
+  -c, --check       Only report installed and available versions.
+  -f, --force       Reinstall even if the installed version is current.
+      --download-json
+                    Take the version from the website's download.json instead
+                    of the in-app updater feed. The website lags behind: it only
+                    advertises builds that finished their staged rollout.
+      --keep        Keep the temporary download directory.
+  -h, --help        Show this help.
+
+Environment:
+  YM_ROOT_CMD       Escalation command to use (e.g. "sudo" or "pkexec").
+EOF
+}
+
+log() { printf '[yandex-music] %s\n' "$*"; }
+die() { printf '[yandex-music] error: %s\n' "$*" >&2; exit 1; }
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+# sudo when it can ask on a terminal (or already has a valid timestamp),
+# pkexec otherwise — the app's own update path is graphical and has no tty.
+as_root() {
+  if [[ $EUID -eq 0 ]]; then
+    "$@"
+  elif [[ -n "${YM_ROOT_CMD:-}" ]]; then
+    $YM_ROOT_CMD "$@"
+  elif command -v sudo >/dev/null 2>&1 && { sudo -n true 2>/dev/null || [[ -t 0 ]]; }; then
+    sudo "$@"
+  elif command -v pkexec >/dev/null 2>&1; then
+    pkexec "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    die "no way to become root: install sudo or pkexec"
+  fi
+}
+
+check_only=0 force=0 keep=0 source_mode=yml
+
+while (($#)); do
+  case "$1" in
+    -c|--check) check_only=1 ;;
+    -f|--force) force=1 ;;
+    --download-json) source_mode=json ;;
+    --keep) keep=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown argument: $1 (see --help)" ;;
+  esac
+  shift
+done
+
+require_command curl
+require_command rpm
+
+deb_file="" expected_sha512=""
+
+# electron-updater feed: `path` is the .deb file name and the top-level `sha512`
+# is its base64 digest, inline or folded onto the next line.
+read_from_yml() {
+  local yml
+  yml="$(curl -fsSL -m 30 "$BASE_URL/latest-linux.yml?r=$(date +%s)")" || return 1
+  deb_file="$(sed -nE 's/^path:[[:space:]]*"?([^"[:space:]]+)"?[[:space:]]*$/\1/p' <<<"$yml" | head -n 1)"
+  [[ -n "$deb_file" ]] || return 1
+  expected_sha512="$(awk '
+    /^sha512:/ {
+      sub(/^sha512:[[:space:]]*/, "")
+      if ($0 == ">-" || $0 == ">" || $0 == "|" || $0 == "|-" || $0 == "") { getline }
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+      print; exit
+    }' <<<"$yml")"
+}
+
+read_from_json() {
+  local json
+  json="$(curl -fsSL -m 30 "$BASE_URL/download.json?r=$(date +%s)")" || return 1
+  deb_file="$(grep -oE 'Yandex_Music_amd64_[^"/]+\.deb' <<<"$json" | head -n 1)"
+  expected_sha512=""
+  [[ -n "$deb_file" ]]
+}
+
+if [[ "$source_mode" == yml ]]; then
+  if ! read_from_yml; then
+    log "updater feed unavailable, falling back to download.json"
+    read_from_json || die "could not determine the latest version"
+  fi
+else
+  read_from_json || die "could not determine the latest version"
+fi
+
+[[ "$deb_file" =~ ^Yandex_Music_amd64_[^/]+\.deb$ ]] \
+  || die "unexpected package name: $deb_file"
+
+version="$(sed -E 's/^Yandex_Music_amd64_(.+)\.deb$/\1/' <<<"$deb_file")"
+deb_url="$BASE_URL/$deb_file"
+
+installed_version="$(rpm -q --qf '%{VERSION}' "$PACKAGE" 2>/dev/null)" || installed_version=""
+
+log "available: $version"
+log "installed: ${installed_version:-not installed}"
+
+if ((check_only)); then
+  [[ "$installed_version" == "$version" ]] && exit 0 || exit 1
+fi
+
+if [[ "$installed_version" == "$version" ]] && ((!force)); then
+  log "already up to date"
+  exit 0
+fi
+
+workdir="$(mktemp -d -t yandex-music-update.XXXXXX)"
+cleanup() {
+  if ((keep)); then
+    log "kept temporary directory: $workdir"
+  else
+    rm -rf "$workdir"
+  fi
+}
+trap cleanup EXIT
+chmod 755 "$workdir"   # root reads the .deb from here
+
+log "downloading $deb_file"
+curl -fL --retry 3 --retry-delay 2 -o "$workdir/$deb_file" "$deb_url"
+
+if [[ -n "$expected_sha512" ]] && command -v openssl >/dev/null 2>&1; then
+  actual="$(openssl dgst -sha512 -binary "$workdir/$deb_file" | openssl base64 -A)"
+  [[ "$actual" == "$expected_sha512" ]] || die "sha512 mismatch for $deb_file"
+  log "sha512 verified"
+fi
+
+[[ -x "$INSTALLER" ]] || die "installer helper not found: $INSTALLER (run install.sh)"
+
+log "installing as root"
+as_root "$INSTALLER" "$workdir/$deb_file"
+
+log "Yandex Music $version installed"

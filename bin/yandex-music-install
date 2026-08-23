@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Install a Yandex Music .deb on an RPM-based system.
+#
+# Runs as root. Converts the package with alien and installs the resulting RPM
+# with dnf, then re-applies the app.asar patch so the app's own "Обновить"
+# button keeps landing here instead of on dpkg/apt-get.
+#
+# Called both by yandex-music-update and by the patched app itself (through
+# pkexec), so its argument list must stay `<path-to-deb>`.
+set -Eeuo pipefail
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+LOG="${YM_LOG:-/var/log/yandex-music-install.log}"
+PATCHER=/usr/local/bin/patch-yandex-music-updater
+
+do_patch=1
+deb=""
+
+usage() {
+  cat <<'EOF'
+Usage: yandex-music-install [--no-patch] <Yandex_Music_amd64_X.Y.Z.deb>
+
+Converts the .deb to an RPM with alien and installs it with dnf. Must run as
+root. Re-applies the in-app updater patch afterwards unless --no-patch.
+EOF
+}
+
+log() {
+  local line
+  line="$(date -Is) [yandex-music-install] $*"
+  printf '%s\n' "$line"
+  printf '%s\n' "$line" >>"$LOG" 2>/dev/null || true
+}
+
+die() {
+  log "error: $*"
+  exit 1
+}
+
+while (($#)); do
+  case "$1" in
+    --no-patch) do_patch=0 ;;
+    -h|--help) usage; exit 0 ;;
+    -*) die "unknown argument: $1" ;;
+    *) [[ -z "$deb" ]] || die "expected exactly one .deb path"; deb="$1" ;;
+  esac
+  shift
+done
+
+[[ $EUID -eq 0 ]] || die "must run as root"
+[[ -n "$deb" ]] || { usage >&2; exit 2; }
+[[ -f "$deb" ]] || die "not a file: $deb"
+[[ "$(basename -- "$deb")" =~ ^Yandex_Music_amd64_.+\.deb$ ]] \
+  || die "refusing to install unexpected package: $deb"
+
+for cmd in alien dnf rpm; do
+  command -v "$cmd" >/dev/null 2>&1 || die "required command not found: $cmd"
+done
+
+log "installing $deb"
+
+workdir="$(mktemp -d -t yandex-music-install.XXXXXX)"
+trap 'rm -rf "$workdir"' EXIT
+
+cp -- "$deb" "$workdir/"
+cd "$workdir"
+
+log "converting deb to rpm with alien"
+alien -r --scripts "$(basename -- "$deb")" >>"$LOG" 2>&1 \
+  || die "alien failed, see $LOG"
+
+rpm_file="$(find . -maxdepth 1 -type f -name '*.rpm' | sort | tail -n 1)"
+[[ -n "$rpm_file" ]] || die "alien did not produce an RPM file"
+
+log "installing $(basename -- "$rpm_file") with dnf"
+dnf install -y "$rpm_file" >>"$LOG" 2>&1 || die "dnf install failed, see $LOG"
+
+if ((do_patch)) && [[ -x "$PATCHER" ]]; then
+  log "re-applying in-app updater patch"
+  "$PATCHER" >>"$LOG" 2>&1 || log "warning: patch failed, see $LOG"
+fi
+
+log "done"
