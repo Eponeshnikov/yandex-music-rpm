@@ -16,6 +16,7 @@ set -Eeuo pipefail
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 LOG="${YM_LOG:-/var/log/yandex-music-install.log}"
 PATCHER=/usr/local/bin/patch-yandex-music-updater
+LOCK="${YM_LOCK:-/run/yandex-music-install.lock}"
 APP_BIN="${YM_APP_BIN:-/usr/bin/yandexmusic}"
 APP_DIR="${YM_APP_DIR:-/opt/Яндекс Музыка}"
 
@@ -86,25 +87,47 @@ app_pids() {
   return 0
 }
 
-# The app is about to be killed and restarted, so its own environment is the
-# only reliable source of the user's graphical session.
+# Who is behind this install: pkexec says so directly; otherwise fall back to
+# the running app, and finally to whoever owns the .deb — the app downloads it
+# into its own user's cache.
+caller_uid() {
+  local pid uid=""
+  [[ -n "${PKEXEC_UID:-}" ]] && { printf '%s\n' "$PKEXEC_UID"; return 0; }
+  for pid in $(app_pids); do
+    uid="$(stat -c %u "/proc/$pid" 2>/dev/null || true)"
+    [[ -n "$uid" ]] && break
+  done
+  [[ -n "$uid" ]] || uid="$(stat -c %u -- "$deb" 2>/dev/null || true)"
+  [[ -n "$uid" ]] || return 1
+  printf '%s\n' "$uid"
+}
+
+# The user bus is all that notify-send and systemd-run --user need, and it is
+# derivable from the uid alone — the app's own environment is gone by the time
+# the update finishes. DISPLAY/WAYLAND_DISPLAY are picked up as a bonus while
+# the app is still alive; without them systemd-run --user still works, because
+# the session imports them into the user manager itself.
 capture_session() {
-  session_uid="${PKEXEC_UID:-}"
+  local pid environ value var
   session_env=()
-  local pid environ value
+  session_uid="${YM_UID:-}"
+  [[ -n "$session_uid" ]] || session_uid="$(caller_uid || true)"
+  [[ -n "$session_uid" && "$session_uid" != 0 ]] || return 1
+  session_user="$(id -nu "$session_uid" 2>/dev/null)" || return 1
+  session_env=(
+    "XDG_RUNTIME_DIR=/run/user/$session_uid"
+    "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$session_uid/bus"
+  )
   for pid in $(app_pids); do
     [[ -r "/proc/$pid/environ" ]] || continue
-    [[ -n "$session_uid" ]] || session_uid="$(stat -c %u "/proc/$pid")"
     environ="$(tr '\0' '\n' <"/proc/$pid/environ")"
-    for var in DISPLAY WAYLAND_DISPLAY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS \
-               XAUTHORITY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP LANG; do
+    for var in DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_CURRENT_DESKTOP LANG; do
       value="$(grep -m1 "^$var=" <<<"$environ" || true)"
       [[ -n "$value" ]] && session_env+=("$value")
     done
     break
   done
-  [[ -n "$session_uid" ]] || return 1
-  session_user="$(id -nu "$session_uid" 2>/dev/null)" || return 1
+  [[ -d "/run/user/$session_uid" ]] || return 1
 }
 
 run_as_user() {
@@ -148,6 +171,32 @@ stop_app() {
   fi
 }
 
+# --- serialization ---------------------------------------------------------
+
+# Two clicks on "Обновить" start two installs of the same .deb; without a lock
+# the second one kills the app the first one has just restarted and then trips
+# over the package file the first one already consumed.
+take_lock() {
+  exec 9>"$LOCK"
+  if ! flock -n 9; then
+    log "another install is running, waiting for it"
+    flock -w 900 9 || die "timed out waiting for the running install"
+  fi
+}
+
+deb_version() {
+  sed -E 's/^Yandex_Music_amd64_(.+)\.deb$/\1/' <<<"$(basename -- "$deb")"
+}
+
+installed_version() {
+  rpm -q --qf '%{VERSION}' yandexmusic 2>/dev/null || true
+}
+
+drop_pending_deb() {
+  [[ "$deb" == */yandexmusic-updater/pending/* ]] && rm -f -- "$deb"
+  return 0
+}
+
 # --- the actual install ----------------------------------------------------
 
 do_install() {
@@ -156,7 +205,7 @@ do_install() {
   workdir="$(mktemp -d -t yandex-music-install.XXXXXX)"
   trap 'rm -rf "$workdir"' EXIT
 
-  cp -- "$deb" "$workdir/"
+  cp -- "$deb" "$workdir/" || die "could not read $deb"
 
   log "converting deb to rpm with alien"
   # An uncompressed payload cuts the conversion of a ~90 MB package from minutes
@@ -187,8 +236,11 @@ case "$mode" in
     if command -v systemd-run >/dev/null 2>&1; then
       # A transient unit leaves the app's cgroup behind, so the install survives
       # the app quitting — or the desktop force-quitting it.
+      # systemd-run hands the worker a clean environment, so the one thing it
+      # cannot rediscover on its own — who asked for this — goes in explicitly.
       systemd-run --quiet --collect \
         --property=KillMode=process \
+        --setenv="YM_UID=$(caller_uid)" \
         --unit="yandex-music-install-$(date +%s)" \
         --description="Yandex Music update" \
         -- "$0" "${worker_args[@]}" "$deb"
@@ -198,10 +250,22 @@ case "$mode" in
     exit 0
     ;;
   foreground)
+    take_lock
     do_install
     log "done"
     ;;
   worker)
+    take_lock
+    # By the time the lock is free, an earlier run may have done this already.
+    if [[ ! -f "$deb" ]]; then
+      log "nothing to do: $deb is gone, another run has consumed it"
+      exit 0
+    fi
+    if [[ "$(installed_version)" == "$(deb_version)" ]]; then
+      log "nothing to do: $(deb_version) is already installed"
+      drop_pending_deb
+      exit 0
+    fi
     capture_session || log "warning: could not determine the user session"
     notify "Обновление" "Устанавливается новая версия…"
     # electron-updater relaunches the app right after our caller returns; give
@@ -211,8 +275,8 @@ case "$mode" in
     stop_app
     # A subshell so a failure inside do_install lands here instead of exiting.
     if ( do_install ); then
-      version="$(rpm -q --qf '%{VERSION}' yandexmusic 2>/dev/null || echo '')"
-      [[ "$deb" == */yandexmusic-updater/pending/* ]] && rm -f -- "$deb"
+      version="$(installed_version)"
+      drop_pending_deb
       log "restarting the app"
       relaunch_app
       notify "Обновление установлено" "Яндекс Музыка ${version:-обновлена}"
