@@ -3,7 +3,14 @@
 set -Eeuo pipefail
 
 PREFIX="${PREFIX:-/usr/local/bin}"
+LIBDIR="${LIBDIR:-/usr/local/lib/yandex-music-rpm}"
 remove_app=1
+
+repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+for candidate in "$LIBDIR/common.sh" "$repo_dir/lib/ym-common.sh"; do
+  # shellcheck source=lib/ym-common.sh
+  [[ -r "$candidate" ]] && { . "$candidate"; break; }
+done
 
 usage() {
   cat <<'EOF'
@@ -65,14 +72,15 @@ root_script=()
 if rpm -q yandexmusic >/dev/null 2>&1; then
   if ((remove_app)); then
     stop_app
-    log "removing the yandexmusic package"
-    root_script+=("dnf remove -y yandexmusic")
+    log "removing the yandexmusic package with $(ym_pm_name)"
+    root_script+=(". $LIBDIR/common.sh 2>/dev/null || . $repo_dir/lib/ym-common.sh; ym_remove_package")
   elif [[ -x "$PREFIX/patch-yandex-music-updater" ]]; then
     log "keeping Yandex Music, reverting the in-app updater patch"
     root_script+=("$PREFIX/patch-yandex-music-updater --revert || true")
   fi
 fi
 root_script+=("rm -f $PREFIX/yandex-music-update $PREFIX/yandex-music-install $PREFIX/patch-yandex-music-updater")
+root_script+=("rm -rf $LIBDIR")
 
 as_root /bin/bash -c "set -e; $(printf '%s; ' "${root_script[@]}")"
 

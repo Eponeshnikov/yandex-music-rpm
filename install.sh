@@ -4,6 +4,10 @@ set -Eeuo pipefail
 
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PREFIX="${PREFIX:-/usr/local/bin}"
+LIBDIR="${LIBDIR:-/usr/local/lib/yandex-music-rpm}"
+YM_LIB="$repo_dir/lib/ym-common.sh"
+# shellcheck source=lib/ym-common.sh
+. "$YM_LIB" || { printf 'error: lib/ym-common.sh not found\n' >&2; exit 1; }
 ALIAS_NAME=ymupd
 want_alias=1 want_patch=1 want_deps=1 want_app=1
 
@@ -22,7 +26,7 @@ Options:
   --no-alias     Do not touch ~/.bashrc.
   --no-patch     Do not patch the installed app.
   --no-app       Do not install Yandex Music itself if it is missing.
-  --no-deps      Do not install missing dependencies (alien).
+  --no-deps      Do not install missing dependencies.
   --prefix DIR   Install into DIR instead of /usr/local/bin.
   -h, --help     Show this help.
 EOF
@@ -62,25 +66,41 @@ while (($#)); do
 done
 
 command -v rpm >/dev/null 2>&1 || die "this installer is for RPM-based distributions"
-command -v dnf >/dev/null 2>&1 || die "dnf not found"
-command -v python3 >/dev/null 2>&1 || die "python3 not found"
-command -v curl >/dev/null 2>&1 || die "curl not found"
-
-missing_deps=()
-command -v alien >/dev/null 2>&1 || missing_deps+=(alien)
+ym_pm >/dev/null || die "no supported package manager found (dnf, zypper, epm, apt-get)"
+log "package manager: $(ym_pm_name)"
 
 root_script=()
-if ((${#missing_deps[@]})); then
+
+mapfile -t missing_required < <(ym_missing_required)
+if ((${#missing_required[@]})); then
+  packages=()
+  for tool in "${missing_required[@]}"; do
+    packages+=("$(ym_package_for "$tool" || printf '%s' "$tool")")
+  done
   if ((want_deps)); then
-    log "will install missing dependencies: ${missing_deps[*]}"
-    root_script+=("dnf install -y ${missing_deps[*]}")
+    log "missing: ${missing_required[*]} — installing ${packages[*]}"
+    root_script+=("$(ym_install_command "${packages[@]}")")
   else
-    die "missing dependencies: ${missing_deps[*]} (dnf install -y ${missing_deps[*]})"
+    die "missing required tools: ${missing_required[*]} ($(ym_install_hint "${packages[@]}"))"
   fi
 fi
 
+mapfile -t missing_optional < <(ym_missing_optional)
+for tool in "${missing_optional[@]:-}"; do
+  [[ -n "$tool" ]] || continue
+  case "$tool" in
+    openssl) log "note: openssl missing — the sha512 from the update feed will not be checked" ;;
+    pkexec) log "note: pkexec missing — the app's own update button cannot ask for a password" ;;
+    systemd-run) log "note: systemd-run missing — the background install falls back to setsid" ;;
+    notify-send) log "note: notify-send missing — no update notifications" ;;
+    flock) log "note: flock missing — two clicks on «Обновить» will not be serialized" ;;
+  esac
+  log "      install it with: $(ym_install_hint "$(ym_package_for "$tool" || printf '%s' "$tool")")"
+done
+
 log "installing scripts into $PREFIX"
-root_script+=("install -d -m 0755 $PREFIX")
+root_script+=("install -d -m 0755 $PREFIX $LIBDIR")
+root_script+=("install -m 0644 $repo_dir/lib/ym-common.sh $LIBDIR/common.sh")
 root_script+=("install -m 0755 -t $PREFIX \
   $repo_dir/bin/yandex-music-update \
   $repo_dir/bin/yandex-music-install \

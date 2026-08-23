@@ -9,7 +9,21 @@ set -Eeuo pipefail
 
 BASE_URL="${YM_BASE_URL:-https://desktop.app.music.yandex.net/stable}"
 INSTALLER="${YM_INSTALLER:-/usr/local/bin/yandex-music-install}"
-PACKAGE=yandexmusic
+PACKAGE="${YM_PACKAGE:-yandexmusic}"
+
+# The shared package-manager layer: installed copy first, repo checkout second.
+ym_lib_path() {
+  local self_dir candidate
+  self_dir="$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+  for candidate in "${YM_LIB:-}" /usr/local/lib/yandex-music-rpm/common.sh \
+                   "$self_dir/../lib/ym-common.sh" "$self_dir/lib/ym-common.sh"; do
+    [[ -n "$candidate" && -r "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
+  done
+  return 1
+}
+YM_LIB="$(ym_lib_path)" || { printf 'error: ym-common.sh not found\n' >&2; exit 1; }
+# shellcheck source=/dev/null
+. "$YM_LIB"
 
 usage() {
   cat <<'EOF'
@@ -32,10 +46,6 @@ EOF
 
 log() { printf '[yandex-music] %s\n' "$*"; }
 die() { printf '[yandex-music] error: %s\n' "$*" >&2; exit 1; }
-
-require_command() {
-  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
-}
 
 # sudo when it can ask on a terminal (or already has a valid timestamp),
 # pkexec otherwise — the app's own update path is graphical and has no tty.
@@ -69,8 +79,7 @@ while (($#)); do
   shift
 done
 
-require_command curl
-require_command rpm
+ym_require_deps || exit 1
 
 deb_file="" expected_sha512=""
 
@@ -119,7 +128,7 @@ fi
 version="$(sed -E 's/^Yandex_Music_amd64_(.+)\.deb$/\1/' <<<"$deb_file")"
 deb_url="$BASE_URL/$deb_file"
 
-installed_version="$(rpm -q --qf '%{VERSION}' "$PACKAGE" 2>/dev/null)" || installed_version=""
+installed_version="$(ym_installed_version)"
 
 log "available: $version"
 log "installed: ${installed_version:-not installed}"

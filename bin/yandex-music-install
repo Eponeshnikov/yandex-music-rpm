@@ -17,6 +17,20 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 LOG="${YM_LOG:-/var/log/yandex-music-install.log}"
 PATCHER=/usr/local/bin/patch-yandex-music-updater
 LOCK="${YM_LOCK:-/run/yandex-music-install.lock}"
+
+# The shared package-manager layer: installed copy first, repo checkout second.
+ym_lib_path() {
+  local self_dir candidate
+  self_dir="$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+  for candidate in "${YM_LIB:-}" /usr/local/lib/yandex-music-rpm/common.sh \
+                   "$self_dir/../lib/ym-common.sh" "$self_dir/lib/ym-common.sh"; do
+    [[ -n "$candidate" && -r "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
+  done
+  return 1
+}
+YM_LIB="$(ym_lib_path)" || { printf 'error: ym-common.sh not found\n' >&2; exit 1; }
+# shellcheck source=/dev/null
+. "$YM_LIB"
 APP_BIN="${YM_APP_BIN:-/usr/bin/yandexmusic}"
 APP_DIR="${YM_APP_DIR:-/opt/Яндекс Музыка}"
 
@@ -68,9 +82,7 @@ done
 [[ "$(basename -- "$deb")" =~ ^Yandex_Music_amd64_.+\.deb$ ]] \
   || die "refusing to install unexpected package: $deb"
 
-for cmd in alien dnf rpm; do
-  command -v "$cmd" >/dev/null 2>&1 || die "required command not found: $cmd"
-done
+ym_require_deps || exit 1
 
 # --- session helpers, for the detached worker ------------------------------
 
@@ -188,9 +200,7 @@ deb_version() {
   sed -E 's/^Yandex_Music_amd64_(.+)\.deb$/\1/' <<<"$(basename -- "$deb")"
 }
 
-installed_version() {
-  rpm -q --qf '%{VERSION}' yandexmusic 2>/dev/null || true
-}
+installed_version() { ym_installed_version; }
 
 drop_pending_deb() {
   [[ "$deb" == */yandexmusic-updater/pending/* ]] && rm -f -- "$deb"
@@ -207,19 +217,8 @@ do_install() {
 
   cp -- "$deb" "$workdir/" || die "could not read $deb"
 
-  log "converting deb to rpm with alien"
-  # An uncompressed payload cuts the conversion of a ~90 MB package from minutes
-  # to seconds; the RPM is a throwaway that dnf reads back immediately.
-  printf '%%_binary_payload w0.gzdio\n' >"$workdir/.rpmmacros"
-  ( cd "$workdir" && HOME="$workdir" alien -r --scripts "$(basename -- "$deb")" ) \
-    >>"$LOG" 2>&1 || die "alien failed, see $LOG"
-
-  rpm_file="$(find "$workdir" -maxdepth 1 -type f -name '*.rpm' | sort | tail -n 1)"
-  [[ -n "$rpm_file" ]] || die "alien did not produce an RPM file"
-
-  log "installing $(basename -- "$rpm_file") with dnf"
-  dnf install -y --allow-downgrade "$rpm_file" >>"$LOG" 2>&1 \
-    || die "dnf install failed, see $LOG"
+  ym_install_deb "$workdir/$(basename -- "$deb")" "$workdir" >>"$LOG" 2>&1 \
+    || die "install failed, see $LOG"
 
   if ((do_patch)) && [[ -x "$PATCHER" ]]; then
     log "re-applying in-app updater patch"
