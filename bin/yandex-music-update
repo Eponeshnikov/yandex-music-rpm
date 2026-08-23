@@ -91,11 +91,17 @@ read_from_yml() {
 }
 
 read_from_json() {
-  local json
+  local json site_deb
   json="$(curl -fsSL -m 30 "$BASE_URL/download.json?r=$(date +%s)")" || return 1
-  deb_file="$(grep -oE 'Yandex_Music_amd64_[^"/]+\.deb' <<<"$json" | head -n 1)"
+  site_deb="$(grep -oE 'Yandex_Music_amd64_[^"/]+\.deb' <<<"$json" | head -n 1)"
+  [[ -n "$site_deb" ]] || return 1
   expected_sha512=""
-  [[ -n "$deb_file" ]]
+  # download.json publishes no checksum, but when the updater feed happens to be
+  # on the same build its sha512 covers this exact file.
+  if read_from_yml && [[ "$deb_file" != "$site_deb" ]]; then
+    expected_sha512=""
+  fi
+  deb_file="$site_deb"
 }
 
 if [[ "$source_mode" == yml ]]; then

@@ -5,20 +5,23 @@ set -Eeuo pipefail
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PREFIX="${PREFIX:-/usr/local/bin}"
 ALIAS_NAME=ymupd
-want_alias=1 want_patch=1 want_deps=1
+want_alias=1 want_patch=1 want_deps=1 want_app=1
 
 usage() {
   cat <<'EOF'
 Usage: ./install.sh [options]
 
 Installs yandex-music-update, yandex-music-install and
-patch-yandex-music-updater into /usr/local/bin, patches an already installed
-Yandex Music so its "Обновить" button works, and adds a shell alias.
+patch-yandex-music-updater into /usr/local/bin and adds a shell alias. If Yandex
+Music is already installed, patches it so its "Обновить" button works; if it is
+not, downloads and installs it (the version from the site's download.json) and
+patches that.
 
 Options:
   --alias NAME   Alias name for yandex-music-update (default: ymupd).
   --no-alias     Do not touch ~/.bashrc.
   --no-patch     Do not patch the installed app.
+  --no-app       Do not install Yandex Music itself if it is missing.
   --no-deps      Do not install missing dependencies (alien).
   --prefix DIR   Install into DIR instead of /usr/local/bin.
   -h, --help     Show this help.
@@ -49,6 +52,7 @@ while (($#)); do
     --alias) ALIAS_NAME="${2:?--alias needs a name}"; shift ;;
     --no-alias) want_alias=0 ;;
     --no-patch) want_patch=0 ;;
+    --no-app) want_app=0 ;;
     --no-deps) want_deps=0 ;;
     --prefix) PREFIX="${2:?--prefix needs a directory}"; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -82,9 +86,17 @@ root_script+=("install -m 0755 -t $PREFIX \
   $repo_dir/bin/yandex-music-install \
   $repo_dir/bin/patch-yandex-music-updater")
 
-if ((want_patch)) && rpm -q yandexmusic >/dev/null 2>&1; then
-  log "Yandex Music is installed, will patch its in-app updater"
-  root_script+=("$PREFIX/patch-yandex-music-updater")
+if rpm -q yandexmusic >/dev/null 2>&1; then
+  if ((want_patch)); then
+    log "Yandex Music is installed, will patch its in-app updater"
+    root_script+=("$PREFIX/patch-yandex-music-updater")
+  fi
+elif ((want_app)); then
+  log "Yandex Music is not installed, will download and install it"
+  # Same escalation as everything else, so this stays a single password prompt.
+  # The site's download.json is the right source for a first install; updates
+  # then come from the app's own feed, through the button or yandex-music-update.
+  root_script+=("$PREFIX/yandex-music-update --download-json")
 fi
 
 # One escalation for the whole job, so the user sees a single password prompt.
@@ -102,7 +114,7 @@ if ((want_alias)); then
 fi
 
 if ! rpm -q yandexmusic >/dev/null 2>&1; then
-  log "Yandex Music is not installed yet — run: $PREFIX/yandex-music-update"
+  log "Yandex Music is not installed — run: $PREFIX/yandex-music-update"
 fi
 
 log "done"
