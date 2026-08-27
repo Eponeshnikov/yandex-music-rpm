@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Install a Yandex Music .deb on an RPM-based system.
 #
-# Runs as root. Converts the package with alien, installs the resulting RPM with
-# dnf, then re-applies the app.asar patch so the app's own "Обновить" button
-# keeps landing here instead of on dpkg/apt-get.
+# Runs as root. Converts the package to an RPM (alien, or eepm's own repack on
+# ALT Linux), installs it with the distribution's package manager, then
+# re-applies the app.asar patch so the app's own "Обновить" button keeps landing
+# here instead of on dpkg/apt-get.
 #
 # Called both by yandex-music-update (with --foreground) and by the patched app
 # itself through `pkexec /bin/bash -c '<this> <deb>'`. The app runs that command
@@ -42,8 +43,9 @@ usage() {
   cat <<'EOF'
 Usage: yandex-music-install [--foreground] [--no-patch] <Yandex_Music_amd64_X.Y.Z.deb>
 
-Converts the .deb to an RPM with alien and installs it with dnf. Must run as
-root. Re-applies the in-app updater patch afterwards unless --no-patch.
+Converts the .deb to an RPM and installs it with the distribution's package
+manager. Must run as root. Re-applies the in-app updater patch afterwards
+unless --no-patch.
 
   --foreground  Do the work in this process and print progress (used by
                 yandex-music-update). The default detaches a background worker,
@@ -56,7 +58,9 @@ log() {
   local line
   line="$(date -Is) [yandex-music-install] $*"
   printf '%s\n' "$line"
-  printf '%s\n' "$line" >>"$LOG" 2>/dev/null || true
+  # The install steps run with stdout already pointed at the log; appending a
+  # second copy from here would double every line they write.
+  [[ /dev/stdout -ef "$LOG" ]] || printf '%s\n' "$line" >>"$LOG" 2>/dev/null || true
 }
 
 die() {

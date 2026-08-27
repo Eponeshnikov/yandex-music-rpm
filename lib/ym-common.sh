@@ -53,13 +53,17 @@ ym_pm() {
 
 ym_pm_name() { ym_pm 2>/dev/null || printf 'none'; }
 
-# alien is fast and well understood; eepm's own repack is the native answer on
-# ALT Linux, where alien is not part of the picture.
+# eepm's own repack is the native answer on ALT Linux, and it knows how to pull
+# in whatever it needs; everywhere else it is alien. alien only counts when
+# rpmbuild is there too — it shells out to it and fails late and loudly if not.
 ym_converter() {
-  if ym_have alien; then printf 'alien\n'
-  elif ym_have epm; then printf 'epm\n'
-  else return 1
-  fi
+  if [[ -n "${YM_CONVERTER:-}" ]]; then printf '%s\n' "$YM_CONVERTER"; return 0; fi
+  case "$(ym_pm_name)" in
+    epm|apt-rpm) ym_have epm && { printf 'epm\n'; return 0; } ;;
+  esac
+  ym_have alien && ym_have rpmbuild && { printf 'alien\n'; return 0; }
+  ym_have epm && { printf 'epm\n'; return 0; }
+  return 1
 }
 
 ym_installed_version() {
@@ -77,6 +81,21 @@ ym_install_rpm_file() {
   esac
 }
 
+# What to tell a user who has no working converter at all.
+ym_converter_hint() {
+  local packages=(rpm-build)
+  ym_have alien || ym_have epm || packages+=("$(ym_package_for deb-converter)")
+  ym_install_hint "${packages[@]}"
+}
+
+# Last resort when the alien path breaks: eepm repacks .deb itself and installs
+# its own build dependencies on the way, so it often works where alien did not.
+ym_install_deb_epm() {
+  ym_have epm || return 1
+  ym_log "falling back to epm --repack"
+  epm --repack install "$1"
+}
+
 # Convert and install a .deb. Returns non-zero on any failure; output of the
 # heavy lifting goes wherever the caller pointed stdout/stderr.
 ym_install_deb() {
@@ -88,9 +107,17 @@ ym_install_deb() {
       # minutes to seconds; the RPM is a throwaway that the package manager
       # reads back immediately.
       printf '%%_binary_payload w0.gzdio\n' >"$workdir/.rpmmacros"
-      ( cd "$workdir" && HOME="$workdir" alien -r --scripts "$(basename -- "$deb")" ) || return 1
+      if ! ( cd "$workdir" && HOME="$workdir" alien -r --scripts "$(basename -- "$deb")" ); then
+        ym_log "error: alien failed"
+        ym_install_deb_epm "$deb"
+        return
+      fi
       rpm_file="$(find "$workdir" -maxdepth 1 -type f -name '*.rpm' | sort | tail -n 1)"
-      [[ -n "$rpm_file" ]] || { ym_log "error: alien did not produce an RPM file"; return 1; }
+      if [[ -z "$rpm_file" ]]; then
+        ym_log "error: alien did not produce an RPM file"
+        ym_install_deb_epm "$deb"
+        return
+      fi
       ym_log "installing $(basename -- "$rpm_file") with $(ym_pm_name)"
       ym_install_rpm_file "$rpm_file"
       ;;
@@ -99,7 +126,7 @@ ym_install_deb() {
       epm --repack install "$deb"
       ;;
     *)
-      ym_log "error: no way to convert a .deb: install alien or epm"
+      ym_log "error: no way to convert a .deb: $(ym_converter_hint)"
       return 1
       ;;
   esac
@@ -134,7 +161,10 @@ ym_missing_required() {
   for cmd in curl rpm python3; do
     ym_have "$cmd" || missing+=("$cmd")
   done
-  ym_converter >/dev/null || missing+=(alien)
+  # rpmbuild does the actual packing for both converters: alien calls it
+  # directly, and eepm's repack assures it is there before it starts.
+  ym_have rpmbuild || missing+=(rpmbuild)
+  ym_have alien || ym_have epm || missing+=(deb-converter)
   ym_pm >/dev/null || missing+=(package-manager)
   ((${#missing[@]})) && printf '%s\n' "${missing[@]}"
   return 0
@@ -164,7 +194,8 @@ ym_package_for() {
     python3) printf 'python3\n' ;;
     openssl) printf 'openssl\n' ;;
     flock) printf 'util-linux\n' ;;
-    alien)
+    rpmbuild) printf 'rpm-build\n' ;;
+    deb-converter|alien)
       # ALT Linux repacks with eepm instead of alien.
       case "$pm" in
         epm|apt-rpm) printf 'eepm\n' ;;
