@@ -21,6 +21,10 @@ Music is already installed, patches it so its "Обновить" button works; i
 not, downloads and installs it (the version from the site's download.json) and
 patches that.
 
+Also installs yandex-music-links, which opens music.yandex links in the app.
+It changes the default http/https handler, so it is off until you run
+"yandex-music-links enable".
+
 Options:
   --alias NAME   Alias name for yandex-music-update (default: ymupd).
   --no-alias     Do not touch ~/.bashrc.
@@ -104,7 +108,9 @@ root_script+=("install -m 0644 $repo_dir/lib/ym-common.sh $LIBDIR/common.sh")
 root_script+=("install -m 0755 -t $PREFIX \
   $repo_dir/bin/yandex-music-update \
   $repo_dir/bin/yandex-music-install \
-  $repo_dir/bin/patch-yandex-music-updater")
+  $repo_dir/bin/patch-yandex-music-updater \
+  $repo_dir/bin/yandex-music-open \
+  $repo_dir/bin/yandex-music-links")
 
 if rpm -q yandexmusic >/dev/null 2>&1; then
   if ((want_patch)); then
@@ -132,6 +138,8 @@ if ((want_alias)); then
     log "added alias '$ALIAS_NAME' to $rc (open a new shell or: source $rc)"
   fi
 fi
+
+log "to open music.yandex links in the app: $PREFIX/yandex-music-links enable"
 
 if ! rpm -q yandexmusic >/dev/null 2>&1; then
   log "Yandex Music is not installed — run: $PREFIX/yandex-music-update"

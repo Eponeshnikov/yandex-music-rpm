@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# Open music.yandex links in the desktop app, everything else in the browser.
+#
+# Registered (by yandex-music-links) as the system handler for http/https, so
+# it sees every web link clicked outside a browser. Links it does not recognise
+# are handed straight to the browser that was default before, which is recorded
+# at enable time — looking the default up here would find this handler itself.
+#
+# The app only understands its own scheme: yandexmusic://album/1/track/2 is the
+# deeplink for https://music.yandex.ru/album/1/track/2.
+set -Eeuo pipefail
+
+CONFIG_DIR="${YM_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/yandex-music-rpm}"
+BROWSER_FILE="$CONFIG_DIR/browser.desktop"
+APP_BIN="${YM_APP_BIN:-/opt/Яндекс Музыка/yandexmusic}"
+HANDLER_DESKTOP="${YM_HANDLER_DESKTOP:-yandex-music-links.desktop}"
+
+# Paths the app has a screen for. Anything else on music.yandex — support
+# pages, payment flows, the landing page — belongs in a browser.
+APP_PATHS='^/(album|artist|track|playlist|users|genre|chart|home|radio|tag|label|non-music|podcasts|audiobooks|clips|search|iframe)(/|$)'
+
+log() { command -v logger >/dev/null 2>&1 && logger -t yandex-music-open -- "$*" || true; }
+
+browser_desktop() {
+  local entry
+  if [[ -r "$BROWSER_FILE" ]]; then
+    entry="$(<"$BROWSER_FILE")"
+    entry="${entry//[$'\r\n']/}"
+    [[ -n "$entry" && "$entry" != "$HANDLER_DESKTOP" ]] && { printf '%s\n' "$entry"; return 0; }
+  fi
+  return 1
+}
+
+# gtk-launch takes a desktop id, gio launch wants a path; find the file so
+# either can be used, and so a missing entry fails here rather than in the
+# launcher.
+desktop_path() {
+  local id="$1" dir
+  local dirs=("${XDG_DATA_HOME:-$HOME/.local/share}")
+  local IFS=:
+  for dir in ${XDG_DATA_DIRS:-/usr/local/share:/usr/share}; do dirs+=("$dir"); done
+  unset IFS
+  for dir in "${dirs[@]}"; do
+    [[ -r "$dir/applications/$id" ]] && { printf '%s\n' "$dir/applications/$id"; return 0; }
+  done
+  return 1
+}
+
+open_in_browser() {
+  local url="$1" entry path
+  if entry="$(browser_desktop)"; then
+    command -v gtk-launch >/dev/null 2>&1 && { gtk-launch "$entry" "$url" >/dev/null 2>&1 && return 0; }
+    if path="$(desktop_path "$entry")" && command -v gio >/dev/null 2>&1; then
+      gio launch "$path" "$url" >/dev/null 2>&1 && return 0
+    fi
+    log "could not launch $entry for $url, falling back"
+  fi
+  # No recorded browser, or launching it failed: try the usual suspects
+  # directly. xdg-open is not an option — it would come back here.
+  local candidate
+  for candidate in "${BROWSER:-}" firefox chromium chromium-browser google-chrome \
+                   brave-browser vivaldi microsoft-edge epiphany falkon; do
+    [[ -n "$candidate" ]] || continue
+    command -v "$candidate" >/dev/null 2>&1 && { setsid "$candidate" "$url" >/dev/null 2>&1 & return 0; }
+  done
+  log "no browser found for $url"
+  return 1
+}
+
+open_in_app() {
+  local deeplink="$1"
+  [[ -x "$APP_BIN" ]] || return 1
+  setsid "$APP_BIN" "$deeplink" >/dev/null 2>&1 &
+  return 0
+}
+
+# https://music.yandex.ru/album/1/track/2?utm_medium=copy_link -> /album/1/track/2
+to_deeplink() {
+  local url="$1" rest path query
+  [[ "$url" =~ ^[Hh][Tt][Tt][Pp][Ss]?://([^/?#]+)(.*)$ ]] || return 1
+  local host="${BASH_REMATCH[1],,}" tail="${BASH_REMATCH[2]}"
+  host="${host%%:*}"
+  host="${host#www.}"
+  [[ "$host" == music.yandex.* ]] || return 1
+  rest="${tail%%#*}"
+  path="${rest%%\?*}"
+  query=""
+  [[ "$rest" == *\?* ]] && query="${rest#*\?}"
+  [[ -n "$path" ]] || path="/"
+  [[ "$path" =~ $APP_PATHS ]] || return 1
+  # Share links carry tracking the app has no use for; a query that says
+  # something about the page itself (?activeTab=, ?play=) is kept.
+  local kept=() pair
+  set -f
+  local IFS='&'
+  for pair in $query; do
+    case "${pair%%=*}" in
+      ''|utm_*|ref_id|from|_openstat|yclid|lang) ;;
+      *) kept+=("$pair") ;;
+    esac
+  done
+  set +f
+  local out="yandexmusic:/$path"
+  ((${#kept[@]})) && out+="?${kept[*]}"
+  printf '%s\n' "$out"
+}
+
+main() {
+  (($#)) || { printf 'usage: yandex-music-open URL...\n' >&2; exit 2; }
+  local url deeplink status=0
+  for url in "$@"; do
+    case "$url" in
+      yandexmusic://*)
+        open_in_app "$url" || { log "app not installed, dropping $url"; status=1; }
+        continue ;;
+    esac
+    if deeplink="$(to_deeplink "$url")" && open_in_app "$deeplink"; then
+      log "app: $url -> $deeplink"
+    else
+      open_in_browser "$url" || status=1
+    fi
+  done
+  return "$status"
+}
+
+main "$@"

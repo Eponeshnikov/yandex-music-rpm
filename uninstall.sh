@@ -79,7 +79,13 @@ if rpm -q yandexmusic >/dev/null 2>&1; then
     root_script+=("$PREFIX/patch-yandex-music-updater --revert || true")
   fi
 fi
-root_script+=("rm -f $PREFIX/yandex-music-update $PREFIX/yandex-music-install $PREFIX/patch-yandex-music-updater")
+# Hand http/https back to the real browser before the shim disappears, or every
+# web link would open nothing. This is per-user state, so it runs unprivileged.
+if [[ -x "$PREFIX/yandex-music-links" ]]; then
+  log "restoring the default browser"
+  "$PREFIX/yandex-music-links" disable >/dev/null 2>&1 || true
+fi
+root_script+=("rm -f $PREFIX/yandex-music-update $PREFIX/yandex-music-install $PREFIX/patch-yandex-music-updater $PREFIX/yandex-music-open $PREFIX/yandex-music-links")
 root_script+=("rm -rf $LIBDIR")
 
 as_root /bin/bash -c "set -e; $(printf '%s; ' "${root_script[@]}")"

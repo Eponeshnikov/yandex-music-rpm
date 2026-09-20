@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# Turn "open music.yandex links in the app" on and off.
+#
+# There is no way on Linux to route one domain to an app: the desktop picks a
+# handler per URL scheme, not per host. So enabling this makes a small shim,
+# yandex-music-open, the handler for http/https; it sends music.yandex links to
+# the app and everything else to the browser that was default beforehand, which
+# is recorded here so the shim never has to look itself up.
+#
+# Everything is per-user — ~/.local/share/applications and the user's mimeapps
+# list — so no root is needed and disabling puts the old default back.
+set -Eeuo pipefail
+
+APPS_DIR="${YM_APPS_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/applications}"
+CONFIG_DIR="${YM_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/yandex-music-rpm}"
+BROWSER_FILE="$CONFIG_DIR/browser.desktop"
+HANDLER_DESKTOP="yandex-music-links.desktop"
+SCHEMES=(x-scheme-handler/http x-scheme-handler/https)
+
+usage() {
+  cat <<'EOF'
+Usage: yandex-music-links <enable|disable|status>
+
+  enable    Send music.yandex links to the desktop app. Makes yandex-music-open
+            the handler for http and https links and remembers the current
+            browser, which keeps getting every other link.
+  disable   Give http and https back to the remembered browser.
+  status    Show the current handler and the remembered browser.
+
+Environment:
+  YM_BROWSER   Desktop entry to treat as the browser (e.g. firefox.desktop),
+               for when the recorded default is wrong or missing.
+EOF
+}
+
+log() { printf '[yandex-music-links] %s\n' "$*"; }
+die() { printf '[yandex-music-links] error: %s\n' "$*" >&2; exit 1; }
+
+handler_bin() {
+  local self_dir candidate
+  self_dir="$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+  for candidate in "${YM_OPEN:-}" "$self_dir/yandex-music-open" \
+                   /usr/local/bin/yandex-music-open /usr/bin/yandex-music-open; do
+    [[ -n "$candidate" && -x "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
+  done
+  return 1
+}
+
+# `xdg-mime query default` scrapes gio's human-readable output and gets it
+# wrong under a non-C locale (glib prints curly quotes, the regex expects
+# straight ones), so it is the last resort here rather than the first.
+current_default() {
+  local entry=""
+  if command -v gio >/dev/null 2>&1; then
+    entry="$(LC_ALL=C gio mime x-scheme-handler/https 2>/dev/null |
+             sed -n "s/^Default application for .*: \\(.*\\)$/\\1/p" | head -n1)"
+  fi
+  if [[ -z "$entry" ]]; then
+    entry="$(sed -n '/^\[Default Applications\]/,/^\[/p' \
+               "${XDG_CONFIG_HOME:-$HOME/.config}/mimeapps.list" 2>/dev/null |
+             sed -n 's/^x-scheme-handler\/https=//p' | head -n1)"
+  fi
+  [[ -z "$entry" ]] && entry="$(xdg-mime query default x-scheme-handler/https 2>/dev/null | head -n1)"
+  entry="${entry%%;*}"
+  printf '%s\n' "${entry//[$'\r\n ']/}"
+}
+
+refresh_desktop_database() {
+  command -v update-desktop-database >/dev/null 2>&1 &&
+    update-desktop-database "$APPS_DIR" >/dev/null 2>&1 || true
+}
+
+set_default() {
+  local entry="$1" scheme ok=0
+  # xdg-settings is what GNOME and the browsers themselves consult; xdg-mime
+  # writes the mimeapps list the rest of the desktops read. Do both.
+  if command -v xdg-settings >/dev/null 2>&1; then
+    xdg-settings set default-web-browser "$entry" 2>/dev/null && ok=1
+  fi
+  for scheme in "${SCHEMES[@]}"; do
+    xdg-mime default "$entry" "$scheme" 2>/dev/null && ok=1
+  done
+  ((ok)) || return 1
+}
+
+write_handler_desktop() {
+  local exec_path="$1"
+  mkdir -p "$APPS_DIR"
+  # No NoDisplay here, however tempting: gio (and so xdg-mime query, and
+  # GNOME's own lookup) skips hidden entries, and xdg-settings only accepts an
+  # entry that claims text/html as a browser. Hiding it makes the default not
+  # stick.
+  cat >"$APPS_DIR/$HANDLER_DESKTOP" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Yandex Music link handler
+Comment=Opens music.yandex links in the app and the rest in the browser
+Exec="$exec_path" %u
+Terminal=false
+StartupNotify=false
+MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;x-scheme-handler/yandexmusic;
+Categories=Network;WebBrowser;
+EOF
+  refresh_desktop_database
+}
+
+cmd_enable() {
+  local exec_path previous
+  command -v xdg-mime >/dev/null 2>&1 || die "xdg-mime not found (install xdg-utils)"
+  exec_path="$(handler_bin)" || die "yandex-music-open not found next to this script or in /usr/local/bin"
+
+  previous="${YM_BROWSER:-$(current_default)}"
+  if [[ -z "$previous" || "$previous" == "$HANDLER_DESKTOP" ]]; then
+    if [[ -r "$BROWSER_FILE" ]]; then
+      previous="$(<"$BROWSER_FILE")"
+    else
+      previous=""
+      log "note: no default browser recorded — other links will go to the first browser found on PATH"
+      log "      set one with: YM_BROWSER=firefox.desktop yandex-music-links enable"
+    fi
+  fi
+  mkdir -p "$CONFIG_DIR"
+  printf '%s\n' "$previous" >"$BROWSER_FILE"
+
+  write_handler_desktop "$exec_path"
+  set_default "$HANDLER_DESKTOP" || die "could not make $HANDLER_DESKTOP the default http/https handler"
+  log "enabled: music.yandex links open in the app"
+  log "other links go to: ${previous:-<first browser found>}"
+}
+
+cmd_disable() {
+  local previous=""
+  [[ -r "$BROWSER_FILE" ]] && previous="$(<"$BROWSER_FILE")"
+  previous="${YM_BROWSER:-$previous}"
+  if [[ -n "$previous" && "$previous" != "$HANDLER_DESKTOP" ]]; then
+    set_default "$previous" || log "warning: could not restore $previous as the default browser"
+    log "http/https back to $previous"
+  else
+    log "no previous browser recorded — pick one in your desktop settings"
+  fi
+  rm -f "$APPS_DIR/$HANDLER_DESKTOP"
+  rm -f "$BROWSER_FILE"
+  refresh_desktop_database
+  log "disabled"
+}
+
+cmd_status() {
+  local entry
+  entry="$(current_default)"
+  printf 'https handler : %s\n' "${entry:-<none>}"
+  printf 'app links     : %s\n' \
+    "$([[ "$entry" == "$HANDLER_DESKTOP" ]] && printf enabled || printf disabled)"
+  printf 'browser       : %s\n' "$([[ -r "$BROWSER_FILE" ]] && cat "$BROWSER_FILE" || printf '<not recorded>')"
+  printf 'handler shim  : %s\n' "$(handler_bin || printf '<not installed>')"
+}
+
+case "${1:-}" in
+  enable) cmd_enable ;;
+  disable) cmd_disable ;;
+  status) cmd_status ;;
+  -h|--help|help) usage ;;
+  '') usage; exit 2 ;;
+  *) die "unknown command: $1" ;;
+esac
