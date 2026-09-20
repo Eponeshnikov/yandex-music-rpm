@@ -9,6 +9,7 @@ YM_LIB="$repo_dir/lib/ym-common.sh"
 # shellcheck source=lib/ym-common.sh
 . "$YM_LIB" || { printf 'error: lib/ym-common.sh not found\n' >&2; exit 1; }
 ALIAS_NAME=ymupd
+LINKS_ALIAS_NAME=ymlinks
 want_alias=1 want_patch=1 want_deps=1 want_app=1
 
 usage() {
@@ -27,6 +28,9 @@ It changes the default http/https handler, so it is off until you run
 
 Options:
   --alias NAME   Alias name for yandex-music-update (default: ymupd).
+  --links-alias NAME
+                 Alias name for yandex-music-links (default: ymlinks); used as
+                 "ymlinks enable", "ymlinks disable", "ymlinks status".
   --no-alias     Do not touch ~/.bashrc.
   --no-patch     Do not patch the installed app.
   --no-app       Do not install Yandex Music itself if it is missing.
@@ -58,6 +62,7 @@ as_root() {
 while (($#)); do
   case "$1" in
     --alias) ALIAS_NAME="${2:?--alias needs a name}"; shift ;;
+    --links-alias) LINKS_ALIAS_NAME="${2:?--links-alias needs a name}"; shift ;;
     --no-alias) want_alias=0 ;;
     --no-patch) want_patch=0 ;;
     --no-app) want_app=0 ;;
@@ -130,16 +135,45 @@ as_root /bin/bash -c "set -e; $(printf '%s; ' "${root_script[@]}")"
 
 if ((want_alias)); then
   rc="$HOME/.bashrc"
-  marker="# yandex-music-rpm"
-  if grep -Fq "$marker" "$rc" 2>/dev/null; then
-    log "alias already present in $rc"
-  else
-    printf '\n%s\nalias %s=%s\n' "$marker" "$ALIAS_NAME" "$PREFIX/yandex-music-update" >>"$rc"
-    log "added alias '$ALIAS_NAME' to $rc (open a new shell or: source $rc)"
-  fi
+  # Rewrite the marked block instead of appending once: a re-run with a
+  # different --prefix or --alias, and an older install that only knew about
+  # ymupd, both have to end up with exactly these aliases and no stale ones.
+  python3 - "$rc" "$ALIAS_NAME=$PREFIX/yandex-music-update" \
+                  "$LINKS_ALIAS_NAME=$PREFIX/yandex-music-links" <<'BASHRC'
+import sys
+from pathlib import Path
+
+rc, aliases = Path(sys.argv[1]), sys.argv[2:]
+BEGIN, END = "# yandex-music-rpm", "# end yandex-music-rpm"
+
+lines = rc.read_text().splitlines() if rc.exists() else []
+out, inside = [], False
+for line in lines:
+    stripped = line.strip()
+    if stripped == BEGIN:
+        inside = True
+        continue
+    if inside:
+        # Blocks written before the end marker existed are just alias lines.
+        if stripped == END:
+            inside = False
+        elif not stripped or (stripped.startswith("alias ") and "yandex-music" in stripped):
+            pass
+        else:
+            inside = False
+            out.append(line)
+        continue
+    out.append(line)
+
+while out and not out[-1].strip():
+    out.pop()
+out += ["", BEGIN] + ["alias " + a for a in aliases] + [END, ""]
+rc.write_text("\n".join(out))
+BASHRC
+  log "aliases in $rc: $ALIAS_NAME, $LINKS_ALIAS_NAME (open a new shell or: source $rc)"
 fi
 
-log "to open music.yandex links in the app: $PREFIX/yandex-music-links enable"
+log "to open music.yandex links in the app: $LINKS_ALIAS_NAME enable"
 
 if ! rpm -q yandexmusic >/dev/null 2>&1; then
   log "Yandex Music is not installed — run: $PREFIX/yandex-music-update"

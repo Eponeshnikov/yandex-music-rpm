@@ -98,18 +98,29 @@ import sys
 from pathlib import Path
 
 rc = Path(sys.argv[1])
-lines = rc.read_text().splitlines(keepends=True)
-out, skip = [], 0
-for line in lines:
-    if line.strip() == "# yandex-music-rpm":
-        skip = 1
+BEGIN, END = "# yandex-music-rpm", "# end yandex-music-rpm"
+
+out, inside = [], False
+for line in rc.read_text().splitlines():
+    stripped = line.strip()
+    if stripped == BEGIN:
+        inside = True
         continue
-    if skip and line.startswith("alias "):
-        skip = 0
+    if inside:
+        # Blocks written before the end marker existed are just alias lines.
+        if stripped == END:
+            inside = False
+        elif not stripped or (stripped.startswith("alias ") and "yandex-music" in stripped):
+            pass
+        else:
+            inside = False
+            out.append(line)
         continue
-    skip = 0
     out.append(line)
-rc.write_text("".join(out))
+
+while out and not out[-1].strip():
+    out.pop()
+rc.write_text("\n".join(out) + "\n" if out else "")
 PY
 fi
 

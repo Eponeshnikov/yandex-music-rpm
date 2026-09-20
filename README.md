@@ -126,8 +126,8 @@ cd yandex-music-rpm
 Один запрос пароля на всё (через `sudo`, а без терминала — через `pkexec`).
 Чистая установка с нуля занимает около 25 секунд.
 
-Опции: `--alias NAME`, `--no-alias`, `--no-patch`, `--no-app`, `--no-deps`,
-`--prefix DIR`.
+Опции: `--alias NAME`, `--links-alias NAME`, `--no-alias`, `--no-patch`,
+`--no-app`, `--no-deps`, `--prefix DIR`.
 
 ## Использование
 
@@ -145,10 +145,13 @@ ymupd --download-json  # взять версию с сайта, а не из ф�
 ### Ссылки на music.yandex в приложении
 
 ```bash
-yandex-music-links enable    # ссылки music.yandex открываются в приложении
-yandex-music-links status    # что сейчас стоит обработчиком
-yandex-music-links disable   # вернуть всё браузеру
+ymlinks enable    # ссылки music.yandex открываются в приложении
+ymlinks status    # что сейчас стоит обработчиком
+ymlinks disable   # вернуть всё браузеру
 ```
+
+`ymlinks` — алиас на `yandex-music-links` из `~/.bashrc` (имя меняется через
+`--links-alias`).
 
 Приложение понимает только свою схему — `yandexmusic://album/38675162/track/144047769`
 для `https://music.yandex.ru/album/38675162/track/144047769`. Маршрутизации
