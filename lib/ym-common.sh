@@ -66,6 +66,19 @@ ym_converter() {
   return 1
 }
 
+# Where the app itself lives. The .deb (and alien's conversion of it) installs
+# into "/opt/Яндекс Музыка"; eepm's repack on ALT moves it to /opt/yandexmusic.
+# yandex-music-open keeps its own copy of this list — it runs on every click and
+# does not source this file.
+ym_app_dir() {
+  if [[ -n "${YM_APP_DIR:-}" ]]; then printf '%s\n' "$YM_APP_DIR"; return 0; fi
+  local dir
+  for dir in "/opt/Яндекс Музыка" /opt/yandexmusic; do
+    [[ -d "$dir" ]] && { printf '%s\n' "$dir"; return 0; }
+  done
+  return 1
+}
+
 ym_installed_version() {
   rpm -q --qf '%{VERSION}' "$YM_PACKAGE" 2>/dev/null || true
 }

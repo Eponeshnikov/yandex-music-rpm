@@ -33,7 +33,7 @@ YM_LIB="$(ym_lib_path)" || { printf 'error: ym-common.sh not found\n' >&2; exit 
 # shellcheck source=/dev/null
 . "$YM_LIB"
 APP_BIN="${YM_APP_BIN:-/usr/bin/yandexmusic}"
-APP_DIR="${YM_APP_DIR:-/opt/Яндекс Музыка}"
+APP_DIR="$(ym_app_dir || printf '/opt/Яндекс Музыка')"
 
 mode=detach   # detach | foreground | worker
 do_patch=1

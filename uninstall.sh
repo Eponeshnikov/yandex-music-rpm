@@ -56,10 +56,11 @@ as_root() {
 
 # dnf would happily pull the files out from under a running app; stop it first.
 stop_app() {
-  local proc exe pids=()
+  local proc exe app_dir pids=()
+  app_dir="$(ym_app_dir)" || return 0
   for proc in /proc/[0-9]*; do
     exe="$(readlink -f "$proc/exe" 2>/dev/null || true)"
-    [[ "$exe" == /opt/Яндекс\ Музыка/* ]] && pids+=("${proc#/proc/}")
+    [[ "$exe" == "$app_dir"/* ]] && pids+=("${proc#/proc/}")
   done
   ((${#pids[@]})) || return 0
   log "stopping the running app"

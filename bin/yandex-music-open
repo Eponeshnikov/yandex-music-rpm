@@ -12,7 +12,16 @@ set -Eeuo pipefail
 
 CONFIG_DIR="${YM_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/yandex-music-rpm}"
 BROWSER_FILE="$CONFIG_DIR/browser.desktop"
-APP_BIN="${YM_APP_BIN:-/opt/Яндекс Музыка/yandexmusic}"
+# The .deb installs into "/opt/Яндекс Музыка", eepm's repack on ALT into
+# /opt/yandexmusic (same list as ym_app_dir in ym-common.sh). Not
+# /usr/bin/yandexmusic: eepm's wrapper there drops its arguments, so the
+# deeplink would never reach the app.
+APP_BIN="${YM_APP_BIN:-}"
+if [[ -z "$APP_BIN" ]]; then
+  for APP_BIN in "/opt/Яндекс Музыка/yandexmusic" /opt/yandexmusic/yandexmusic; do
+    [[ -x "$APP_BIN" ]] && break
+  done
+fi
 HANDLER_DESKTOP="${YM_HANDLER_DESKTOP:-yandex-music-links.desktop}"
 
 # Paths the app has a screen for. Anything else on music.yandex — support
@@ -69,7 +78,7 @@ open_in_browser() {
 
 open_in_app() {
   local deeplink="$1"
-  [[ -x "$APP_BIN" ]] || return 1
+  [[ -x "$APP_BIN" ]] || { log "app binary not found: $APP_BIN"; return 1; }
   setsid "$APP_BIN" "$deeplink" >/dev/null 2>&1 &
   return 0
 }
